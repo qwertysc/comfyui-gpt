@@ -36,6 +36,8 @@ HTTP_SESSION = requests.Session()
 HTTP_ADAPTER = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10)
 HTTP_SESSION.mount("http://", HTTP_ADAPTER)
 HTTP_SESSION.mount("https://", HTTP_ADAPTER)
+INPUT_IMAGE_WEBP_QUALITY = 100
+INPUT_IMAGE_WEBP_METHOD = 0
 
 
 def api_timeout(timeout_seconds):
@@ -74,22 +76,96 @@ def build_api_url(api_base, endpoint_path):
     return f"{base}/v1{path}"
 
 
-def tensor_to_png_bytes(tensor):
-    """ComfyUI IMAGE tensor -> PNG bytes."""
+def _tensor_to_pil_image(tensor):
     if tensor is None:
         raise ValueError("输入图像为空")
 
-    single = tensor[0:1] if len(tensor.shape) == 4 else tensor.unsqueeze(0)
-    arr = (single[0].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-    img = Image.fromarray(arr, mode="RGB")
+    single = tensor[0] if len(tensor.shape) == 4 else tensor
+    if hasattr(single, "detach"):
+        single = single.detach()
+    if hasattr(single, "cpu"):
+        single = single.cpu()
+
+    arr = np.asarray(single)
+    arr = (arr * 255).clip(0, 255).astype(np.uint8)
+
+    if arr.ndim == 2:
+        return Image.fromarray(arr, mode="L").convert("RGB")
+
+    channels = arr.shape[-1] if arr.ndim == 3 else 0
+    if channels >= 4:
+        return Image.fromarray(arr[:, :, :4], mode="RGBA")
+    if channels == 1:
+        return Image.fromarray(arr[:, :, 0], mode="L").convert("RGB")
+    if channels >= 3:
+        return Image.fromarray(arr[:, :, :3], mode="RGB")
+    raise ValueError(f"不支持的图像 tensor 形状: {getattr(tensor, 'shape', None)}")
+
+
+def _image_has_transparency(img):
+    if img.mode in ("RGBA", "LA"):
+        alpha = img.getchannel("A")
+        return alpha.getextrema()[0] < 255
+    if img.mode == "P" and "transparency" in img.info:
+        return True
+    return False
+
+
+def _base64_length(byte_count):
+    return 4 * ((byte_count + 2) // 3)
+
+
+def data_url_length(image_bytes, mime_type):
+    return len(f"data:{mime_type};base64,") + _base64_length(len(image_bytes))
+
+
+def bytes_to_data_url(image_bytes, mime_type):
+    return f"data:{mime_type};base64," + base64.b64encode(image_bytes).decode("utf-8")
+
+
+def tensor_to_image_payload(tensor, name="image"):
+    """Encode a ComfyUI IMAGE tensor for OpenAI-compatible image input."""
+    img = _tensor_to_pil_image(tensor)
+    has_transparency = _image_has_transparency(img)
+    buf = BytesIO()
+    if has_transparency:
+        mime_type = "image/png"
+        extension = "png"
+        img.convert("RGBA").save(buf, format="PNG")
+    else:
+        mime_type = "image/webp"
+        extension = "webp"
+        img.convert("RGB").save(
+            buf,
+            format="WEBP",
+            quality=INPUT_IMAGE_WEBP_QUALITY,
+            method=INPUT_IMAGE_WEBP_METHOD,
+        )
+
+    image_bytes = buf.getvalue()
+    return {
+        "filename": f"{name}.{extension}",
+        "bytes": image_bytes,
+        "mime_type": mime_type,
+        "format": extension,
+        "has_transparency": has_transparency,
+        "byte_count": len(image_bytes),
+        "data_url_bytes": data_url_length(image_bytes, mime_type),
+    }
+
+
+def tensor_to_png_bytes(tensor):
+    """ComfyUI IMAGE tensor -> PNG bytes."""
+    img = _tensor_to_pil_image(tensor)
     buf = BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
 
 
 def tensor_to_data_url(tensor):
-    """ComfyUI IMAGE tensor -> PNG data URL."""
-    return "data:image/png;base64," + base64.b64encode(tensor_to_png_bytes(tensor)).decode("utf-8")
+    """ComfyUI IMAGE tensor -> compact data URL for multimodal prompts."""
+    payload = tensor_to_image_payload(tensor)
+    return bytes_to_data_url(payload["bytes"], payload["mime_type"])
 
 
 def mask_to_png_bytes(mask):
@@ -579,8 +655,38 @@ class ComfyuiLuckGPTImage2Node:
             tensor = kwargs.get(f"image_{i:02d}")
             if tensor is None:
                 continue
-            image_payloads.append((f"image_{i:02d}.png", tensor_to_png_bytes(tensor)))
+            payload = tensor_to_image_payload(tensor, f"image_{i:02d}")
+            payload["slot"] = f"image_{i:02d}"
+            image_payloads.append(payload)
         return image_payloads
+
+    def _image_payload_summary(self, image_payloads, mask_bytes=None):
+        images = [
+            {
+                "slot": payload["slot"],
+                "filename": payload["filename"],
+                "mime_type": payload["mime_type"],
+                "format": payload["format"],
+                "bytes": payload["byte_count"],
+                "data_url_bytes": payload["data_url_bytes"],
+            }
+            for payload in image_payloads
+        ]
+        total_image_bytes = sum(item["bytes"] for item in images)
+        total_data_url_bytes = sum(item["data_url_bytes"] for item in images)
+        if mask_bytes is not None:
+            mask_data_url_bytes = data_url_length(mask_bytes, "image/png")
+            total_image_bytes += len(mask_bytes)
+            total_data_url_bytes += mask_data_url_bytes
+        else:
+            mask_data_url_bytes = 0
+        return {
+            "images": images,
+            "mask_bytes": len(mask_bytes) if mask_bytes is not None else 0,
+            "mask_data_url_bytes": mask_data_url_bytes,
+            "total_encoded_bytes": total_image_bytes,
+            "total_data_url_bytes": total_data_url_bytes,
+        }
 
     def _responses_image_label(self, filename, index):
         slot = (filename or f"image_{index:02d}.png").rsplit(".", 1)[0]
@@ -624,7 +730,7 @@ class ComfyuiLuckGPTImage2Node:
             tool["partial_images"] = 1
         if mask_bytes is not None:
             tool["input_image_mask"] = {
-                "image_url": "data:image/png;base64," + base64.b64encode(mask_bytes).decode("utf-8")
+                "image_url": bytes_to_data_url(mask_bytes, "image/png")
             }
         return tool
 
@@ -640,11 +746,12 @@ class ComfyuiLuckGPTImage2Node:
             "必须分别执行，不要把另一张图片的人脸或身份错误迁移到结果中。"
         )
         content = [{"type": "input_text", "text": prompt_with_rules}]
-        for index, (filename, image_bytes) in enumerate(image_payloads, 1):
+        for index, payload in enumerate(image_payloads, 1):
+            filename = payload["filename"]
             content.append({"type": "input_text", "text": self._responses_image_label(filename, index)})
             content.append({
                 "type": "input_image",
-                "image_url": "data:image/png;base64," + base64.b64encode(image_bytes).decode("utf-8"),
+                "image_url": bytes_to_data_url(payload["bytes"], payload["mime_type"]),
             })
         return [{"role": "user", "content": content}]
 
@@ -677,8 +784,8 @@ class ComfyuiLuckGPTImage2Node:
 
     def _request_img2img(self, api_base, headers, fields, image_payloads, mask_bytes, timeout_seconds):
         files = [
-            ("image[]", (filename, BytesIO(image_bytes), "image/png"))
-            for filename, image_bytes in image_payloads
+            ("image[]", (payload["filename"], BytesIO(payload["bytes"]), payload["mime_type"]))
+            for payload in image_payloads
         ]
         if mask_bytes is not None:
             files.append(("mask", ("mask.png", BytesIO(mask_bytes), "image/png")))
@@ -784,6 +891,7 @@ class ComfyuiLuckGPTImage2Node:
 
         image_payloads = self._collect_images(kwargs)
         mask_bytes = mask_to_png_bytes(kwargs.get("mask"))
+        image_encoding_summary = self._image_payload_summary(image_payloads, mask_bytes)
         resolved_aspect_ratio = resolve_auto_aspect_ratio(image_size, aspect_ratio, kwargs.get("image_01"))
         effective_size = normalize_size(image_size, resolved_aspect_ratio, custom_size)
 
@@ -809,7 +917,7 @@ class ComfyuiLuckGPTImage2Node:
             stream,
         )
 
-        print(f"[ComfyUI GPT Image] api_mode={api_mode}, mode={actual_mode}, image_size={image_size}, aspect_ratio={aspect_ratio}, resolved_aspect_ratio={resolved_aspect_ratio}, resolved_size={effective_size}, fields={fields}, mainline_model={mainline_model}, seed={seed} (not sent to API)")
+        print(f"[ComfyUI GPT Image] api_mode={api_mode}, mode={actual_mode}, image_size={image_size}, aspect_ratio={aspect_ratio}, resolved_aspect_ratio={resolved_aspect_ratio}, resolved_size={effective_size}, fields={fields}, mainline_model={mainline_model}, seed={seed} (not sent to API), input_encoding={image_encoding_summary}")
         emit_runtime_status(unique_id, "running", "开始生成", 0.0, 0, retry_times, timeout_seconds)
 
         last_error = None
@@ -881,6 +989,7 @@ class ComfyuiLuckGPTImage2Node:
                     "resolved_size": effective_size,
                     "request_fields": fields,
                     "input_images": len(image_payloads),
+                    "input_encoding": image_encoding_summary,
                     "mask": mask_bytes is not None,
                     "output_images": int(image_tensor.shape[0]),
                     "image_refs": image_refs,

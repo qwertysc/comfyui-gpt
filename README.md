@@ -174,6 +174,7 @@ Multi-image reference:
 - Image order matters. You can write prompts such as: `把图1的人物放进图2的场景，参考图3的画风。`
 - If one image is the primary subject, connect it to `image_01`.
 - In `responses_api` mode, the node labels each input as `图1 / image_01`, `图2 / image_02`, and so on before sending it to the API.
+- Normal reference images are encoded as `WebP quality=100` before upload to reduce request size. Transparent images and masks stay as PNG.
 
 Mask behavior:
 
