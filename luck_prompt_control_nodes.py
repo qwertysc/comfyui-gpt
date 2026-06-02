@@ -78,6 +78,39 @@ _PORTRAIT = {"9:16", "3:4", "2:3", "1:2", "9:21", "1:3", "1:4", "1:8"}
 _SQUARE = {"1:1"}
 
 
+def _count_cjk(text):
+    return sum(
+        1
+        for char in str(text or "")
+        if "\u4e00" <= char <= "\u9fff"
+    )
+
+
+def _looks_like_utf8_mojibake(text):
+    value = str(text or "")
+    if not value:
+        return False
+    marker_chars = "ÃÂÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖØÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõöøùúûüýþÿ"
+    return any(char in value for char in marker_chars) or any(0x80 <= ord(char) <= 0x9F for char in value)
+
+
+def _repair_text_encoding(text):
+    value = str(text or "")
+    if not _looks_like_utf8_mojibake(value):
+        return value
+    try:
+        repaired = value.encode("latin-1").decode("utf-8")
+    except UnicodeError:
+        return value
+    if _count_cjk(repaired) > _count_cjk(value):
+        return repaired
+    return value
+
+
+def _clean_text(value):
+    return _repair_text_encoding(value).strip()
+
+
 def _chat_url(api_base):
     return build_api_url(api_base, "/chat/completions")
 
@@ -137,17 +170,19 @@ def _call_chat_completion(api_base, api_key, model, messages, timeout_seconds=60
     except ValueError as exc:
         raise RuntimeError(f"API 返回非 JSON: {response.text[:1000]}") from exc
 
-    raw = _extract_chat_content(data).strip()
+    raw = _clean_text(_extract_chat_content(data))
     if not raw:
         raise RuntimeError(f"模型未返回有效内容: {str(data)[:500]}")
     return raw, data
 
 
 def _parse_tagged_output(raw):
+    raw = _repair_text_encoding(raw)
+
     def extract(tag):
         pattern = rf"{tag}:\s*(.*?)(?=\n\w+_\w+:|$)"
         match = re.search(pattern, raw, re.DOTALL)
-        return match.group(1).strip() if match else ""
+        return _clean_text(match.group(1)) if match else ""
 
     optimized_prompt = extract("optimized_prompt")
     reference_summary = extract("reference_summary")
@@ -548,7 +583,7 @@ class LuckTextListEditor:
             unique_id = unique_id[0] if unique_id else None
 
         texts = text_list if isinstance(text_list, list) else [str(text_list)]
-        cleaned_texts = [str(t).strip() for t in texts]
+        cleaned_texts = [_clean_text(t) for t in texts]
         session_id = str(uuid.uuid4())
         _pending_text_lists[session_id] = {
             "edited_texts": cleaned_texts.copy(),
@@ -606,6 +641,7 @@ def _add_text_editor_routes(routes):
 
             if not isinstance(edited_texts, list):
                 edited_texts = [edited_texts] if edited_texts else []
+            edited_texts = [_clean_text(text) for text in edited_texts]
 
             _pending_text_lists[session_id]["edited_texts"] = edited_texts
             _pending_text_lists[session_id]["confirmed"] = True

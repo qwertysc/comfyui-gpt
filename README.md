@@ -166,12 +166,14 @@ Mode behavior:
 - `AUTO`: text-to-image when no image is connected; image-to-image when one or more images are connected.
 - `text2img`: always text-to-image.
 - `img2img`: requires at least one input image.
+- `image_size=1K/2K/4K` with `aspect_ratio=AUTO` uses the `image_01` aspect ratio when available; without an input image it falls back to `1:1`.
 
 Multi-image reference:
 
 - Connect up to 5 images to `image_01` through `image_05`.
 - Image order matters. You can write prompts such as: `把图1的人物放进图2的场景，参考图3的画风。`
 - If one image is the primary subject, connect it to `image_01`.
+- In `responses_api` mode, the node labels each input as `图1 / image_01`, `图2 / image_02`, and so on before sending it to the API.
 
 Mask behavior:
 
@@ -183,7 +185,7 @@ Size presets:
 
 | aspect_ratio | 1K | 2K | 4K |
 |---|---:|---:|---:|
-| `AUTO` | not sent | not sent | not sent |
+| `AUTO` | resolved from `image_01` ratio, fallback `1024x1024` | resolved from `image_01` ratio, fallback `2048x2048` | resolved from `image_01` ratio, fallback `2880x2880` |
 | `1:4` | `480x1440` | `672x2016` | `1280x3840` |
 | `4:1` | `1440x480` | `2016x672` | `3840x1280` |
 | `1:8` | `480x1440` | `672x2016` | `1280x3840` |

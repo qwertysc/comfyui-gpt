@@ -347,6 +347,50 @@ def _extract_aspect_ratio(value):
     return match.group(0) if match else "16:9"
 
 
+def _is_size_tier(value):
+    option = str(value or "").strip().lower()
+    return option in ("1k", "2k", "4k")
+
+
+def _tensor_dimensions(tensor):
+    if tensor is None:
+        return None
+    shape = getattr(tensor, "shape", None)
+    if shape is None:
+        return None
+    if len(shape) == 4:
+        return int(shape[2]), int(shape[1])
+    if len(shape) == 3:
+        return int(shape[1]), int(shape[0])
+    return None
+
+
+def _nearest_aspect_ratio(width, height):
+    if not width or not height:
+        return "1:1"
+    target = width / height
+    ratios = [ratio for ratio in GPT_IMAGE2_SIZE_TABLE["1K"] if ratio != "AUTO"]
+
+    def ratio_distance(ratio):
+        left, right = [int(part) for part in ratio.split(":")]
+        candidate = left / right
+        return abs(candidate - target) / max(candidate, target)
+
+    return min(ratios, key=ratio_distance)
+
+
+def resolve_auto_aspect_ratio(image_size, aspect_ratio, source_image=None):
+    ratio = _extract_aspect_ratio(aspect_ratio)
+    if ratio != "AUTO" or not _is_size_tier(image_size):
+        return ratio
+
+    dimensions = _tensor_dimensions(source_image)
+    if dimensions is None:
+        return "1:1"
+    width, height = dimensions
+    return _nearest_aspect_ratio(width, height)
+
+
 def normalize_size(image_size, aspect_ratio="16:9", custom_size=""):
     option = (image_size or "2K").strip().replace("×", "x")
     option_lower = option.lower()
@@ -538,6 +582,13 @@ class ComfyuiLuckGPTImage2Node:
             image_payloads.append((f"image_{i:02d}.png", tensor_to_png_bytes(tensor)))
         return image_payloads
 
+    def _responses_image_label(self, filename, index):
+        slot = (filename or f"image_{index:02d}.png").rsplit(".", 1)[0]
+        return (
+            f"图{index} / {slot}: 以下图片是第 {index} 张参考图。"
+            f"提示词中提到“图{index}”或“{slot}”时，均指这张图片；请严格按提示词指定的用途引用它。"
+        )
+
     def _payload_fields(self, model, prompt, size, quality, output_format, output_compression, stream):
         fields = {
             "model": model,
@@ -581,8 +632,16 @@ class ComfyuiLuckGPTImage2Node:
         if not image_payloads:
             return prompt
 
-        content = [{"type": "input_text", "text": prompt}]
-        for _, image_bytes in image_payloads:
+        prompt_with_rules = (
+            f"{prompt}\n\n"
+            "多图引用规则：输入图片按 image_01、image_02、image_03 的顺序提供，"
+            "图1 对应 image_01，图2 对应 image_02，依此类推。"
+            "如果提示词要求从不同图片分别参考人物身份、人脸、服装、构图或风格，"
+            "必须分别执行，不要把另一张图片的人脸或身份错误迁移到结果中。"
+        )
+        content = [{"type": "input_text", "text": prompt_with_rules}]
+        for index, (filename, image_bytes) in enumerate(image_payloads, 1):
+            content.append({"type": "input_text", "text": self._responses_image_label(filename, index)})
             content.append({
                 "type": "input_image",
                 "image_url": "data:image/png;base64," + base64.b64encode(image_bytes).decode("utf-8"),
@@ -723,9 +782,10 @@ class ComfyuiLuckGPTImage2Node:
         if not clean_prompt:
             raise ValueError("prompt 不能为空")
 
-        effective_size = normalize_size(image_size, aspect_ratio, custom_size)
         image_payloads = self._collect_images(kwargs)
         mask_bytes = mask_to_png_bytes(kwargs.get("mask"))
+        resolved_aspect_ratio = resolve_auto_aspect_ratio(image_size, aspect_ratio, kwargs.get("image_01"))
+        effective_size = normalize_size(image_size, resolved_aspect_ratio, custom_size)
 
         if mode == "AUTO":
             actual_mode = "img2img" if image_payloads else "text2img"
@@ -749,7 +809,7 @@ class ComfyuiLuckGPTImage2Node:
             stream,
         )
 
-        print(f"[ComfyUI GPT Image] api_mode={api_mode}, mode={actual_mode}, image_size={image_size}, aspect_ratio={aspect_ratio}, fields={fields}, mainline_model={mainline_model}, seed={seed} (not sent to API)")
+        print(f"[ComfyUI GPT Image] api_mode={api_mode}, mode={actual_mode}, image_size={image_size}, aspect_ratio={aspect_ratio}, resolved_aspect_ratio={resolved_aspect_ratio}, resolved_size={effective_size}, fields={fields}, mainline_model={mainline_model}, seed={seed} (not sent to API)")
         emit_runtime_status(unique_id, "running", "开始生成", 0.0, 0, retry_times, timeout_seconds)
 
         last_error = None
@@ -817,6 +877,7 @@ class ComfyuiLuckGPTImage2Node:
                     "api_base": api_base,
                     "image_size": image_size,
                     "aspect_ratio": aspect_ratio,
+                    "resolved_aspect_ratio": resolved_aspect_ratio,
                     "resolved_size": effective_size,
                     "request_fields": fields,
                     "input_images": len(image_payloads),
