@@ -3,8 +3,6 @@ import { api } from "../../../scripts/api.js";
 
 const EXTENSION_NAME = "comfyui_luck_gpt20.runtime_status";
 const TARGET_NODE_TYPES = new Set([
-    "ComfyuiLuckGPT20Node",
-    "ComfyuiLuckGPTImage2VipNode",
     "ComfyuiLuckGPTImage2Node",
     "LuckReferenceImagePromptOptimizer",
     "LuckGPTImage2PromptOptimizer",

@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Prompt-control helper nodes for Comfyui-Luck gpt-2.0.
-
-These nodes are adapted from the SynVow prompt controllers, but use the
-APIYi OpenAI-compatible chat endpoint and the same Bearer-token style as the
-existing Luck image nodes.
+Prompt-control helper nodes for OpenAI-compatible chat endpoints.
 """
 
 import hashlib
@@ -17,7 +13,7 @@ import uuid
 
 import requests
 
-from .gpt_2_0_node import API_BASE_URLS, DEFAULT_API_BASE_URL, apiyi_post, tensor_to_data_url
+from .gpt_2_0_node import API_BASE_INPUT, DEFAULT_API_BASE_URL, api_post, build_api_url, tensor_to_data_url
 from .gpt_2_0_node import emit_runtime_status
 
 try:
@@ -33,15 +29,13 @@ except Exception:
 
 
 PROMPT_MODEL_OPTIONS = [
-    "gemini-3.5-flash",
     "gpt-5.5",
-    "gpt-4o",
-    "gpt-4.1-mini",
-    "gemini-2.5-flash",
-    "gemini-2.5-pro",
+    "gpt-5.4",
+    "gpt-5.4-mini",
 ]
+PROMPT_DEFAULT_MODEL = "gpt-5.4"
 
-LUCK_PROMPT_CATEGORY = "Comfyui-Luck/gpt-2.0/文本"
+LUCK_PROMPT_CATEGORY = "Comfyui-Luck/gpt-image-2/文本"
 PROMPT_ASPECT_RATIO_OPTIONS = [
     "auto",
     "1:4",
@@ -85,12 +79,7 @@ _SQUARE = {"1:1"}
 
 
 def _chat_url(api_base):
-    base = (api_base or DEFAULT_API_BASE_URL).strip().rstrip("/")
-    if base.endswith("/v1/chat/completions"):
-        return base
-    if base.endswith("/v1"):
-        return f"{base}/chat/completions"
-    return f"{base}/v1/chat/completions"
+    return build_api_url(api_base, "/chat/completions")
 
 
 def _api_headers(api_key):
@@ -124,14 +113,14 @@ def _extract_chat_content(data):
     return str(content or "")
 
 
-def _call_apiyi_chat(api_base, api_key, model, messages, timeout_seconds=600):
-    actual_model = model or PROMPT_MODEL_OPTIONS[0]
+def _call_chat_completion(api_base, api_key, model, messages, timeout_seconds=600):
+    actual_model = model or PROMPT_DEFAULT_MODEL
     payload = {
         "model": actual_model,
         "messages": messages,
         "stream": False,
     }
-    response = apiyi_post(
+    response = api_post(
         _chat_url(api_base),
         timeout_seconds,
         headers=_api_headers(api_key),
@@ -141,12 +130,12 @@ def _call_apiyi_chat(api_base, api_key, model, messages, timeout_seconds=600):
         response.raise_for_status()
     except requests.exceptions.HTTPError as exc:
         body = response.text[:2000] if response.text else "<empty response>"
-        raise RuntimeError(f"API易请求失败: HTTP {response.status_code}; response={body}") from exc
+        raise RuntimeError(f"API 请求失败: HTTP {response.status_code}; response={body}") from exc
 
     try:
         data = response.json()
     except ValueError as exc:
-        raise RuntimeError(f"API易返回非 JSON: {response.text[:1000]}") from exc
+        raise RuntimeError(f"API 返回非 JSON: {response.text[:1000]}") from exc
 
     raw = _extract_chat_content(data).strip()
     if not raw:
@@ -296,7 +285,7 @@ class LuckReferenceImagePromptOptimizer:
         return {
             "required": {
                 "api_key (API密钥)": ("STRING", {"default": "", "multiline": False}),
-                "api_base (接口域名)": (API_BASE_URLS, {"default": DEFAULT_API_BASE_URL}),
+                "api_base (接口域名)": API_BASE_INPUT,
                 "reference_image_01": ("IMAGE",),
                 "user_prompt": ("STRING", {"multiline": True, "default": ""}),
                 "reference_mode": (
@@ -307,7 +296,7 @@ class LuckReferenceImagePromptOptimizer:
                     PROMPT_ASPECT_RATIO_OPTIONS,
                     {"default": "auto"},
                 ),
-                "model": (PROMPT_MODEL_OPTIONS, {"default": "gemini-3.5-flash"}),
+                "model": (PROMPT_MODEL_OPTIONS, {"default": PROMPT_DEFAULT_MODEL}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 2147483647, "control_after_generate": True}),
                 "timeout_seconds (超时秒数)": ("INT", {"default": 600, "min": 30, "max": 1800}),
             },
@@ -327,7 +316,7 @@ class LuckReferenceImagePromptOptimizer:
     RETURN_NAMES = ("optimized_prompt", "reference_summary")
     FUNCTION = "optimize"
     CATEGORY = LUCK_PROMPT_CATEGORY
-    DESCRIPTION = "图生图提示词控制器：API易多模态模型 + 参考图 + 可选主体图 → 结构化生图提示词"
+    DESCRIPTION = "图生图提示词控制器：多模态模型 + 参考图 + 可选主体图 → 结构化生图提示词"
 
     @classmethod
     def IS_CHANGED(cls, **kwargs):
@@ -392,7 +381,7 @@ class LuckReferenceImagePromptOptimizer:
                 timeout_seconds,
             )
             print(f"[Luck Reference Prompt Optimizer] {model} 正在生成，reference_images={len(ref_urls)}, seed={seed} (not sent to API)")
-            raw, _ = _call_apiyi_chat(api_base, api_key, model, messages, timeout_seconds)
+            raw, _ = _call_chat_completion(api_base, api_key, model, messages, timeout_seconds)
             emit_runtime_status(unique_id, "running", "解析提示词", time.time() - start_ts, 1, 1, timeout_seconds)
             optimized_prompt, reference_summary = _parse_tagged_output(raw)
             if not optimized_prompt:
@@ -411,7 +400,7 @@ class LuckGPTImage2PromptOptimizer:
         return {
             "required": {
                 "api_key (API密钥)": ("STRING", {"default": "", "multiline": False}),
-                "api_base (接口域名)": (API_BASE_URLS, {"default": DEFAULT_API_BASE_URL}),
+                "api_base (接口域名)": API_BASE_INPUT,
                 "user_prompt": ("STRING", {"multiline": True, "default": ""}),
                 "layout_type": (
                     ["自动判断", "纯画面", "图文混排海报", "电商主图", "社媒封面"],
@@ -421,7 +410,7 @@ class LuckGPTImage2PromptOptimizer:
                     ["不加文字", "保留原文", "优化原文", "自动生成"],
                     {"default": "保留原文"},
                 ),
-                "model": (PROMPT_MODEL_OPTIONS, {"default": "gemini-3.5-flash"}),
+                "model": (PROMPT_MODEL_OPTIONS, {"default": PROMPT_DEFAULT_MODEL}),
                 "optimize_strength": (["标准", "增强"], {"default": "标准"}),
                 "aspect_ratio": (
                     PROMPT_ASPECT_RATIO_OPTIONS,
@@ -440,7 +429,7 @@ class LuckGPTImage2PromptOptimizer:
     RETURN_NAMES = ("optimized_prompt", "debug_info")
     FUNCTION = "optimize"
     CATEGORY = LUCK_PROMPT_CATEGORY
-    DESCRIPTION = "使用 API易多模态/文本模型优化 GPT-Image-2 图像生成提示词"
+    DESCRIPTION = "使用多模态/文本模型优化 GPT-Image-2 图像生成提示词"
 
     _TEXT_POLICY_MAP = {"不加文字": "none", "保留原文": "preserve", "优化原文": "enhance", "自动生成": "generate"}
     _STRENGTH_MAP = {"light": "标准", "standard": "标准", "strong": "增强"}
@@ -474,7 +463,7 @@ class LuckGPTImage2PromptOptimizer:
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ]
             print(f"[Luck GPT-Image-2 Prompt Optimizer] {model} schema 阶段生成中，seed={seed} (not sent to API)")
-            schema_raw, _ = _call_apiyi_chat(api_base, api_key, model, schema_messages, timeout_seconds)
+            schema_raw, _ = _call_chat_completion(api_base, api_key, model, schema_messages, timeout_seconds)
             emit_runtime_status(unique_id, "running", "整理 Schema", time.time() - start_ts, 1, 2, timeout_seconds)
             schema = _parse_json_response(schema_raw)
             schema = _normalize_schema(schema, aspect_ratio, exact_text, text_policy, optimize_strength, layout_type)
@@ -485,7 +474,7 @@ class LuckGPTImage2PromptOptimizer:
             ]
             emit_runtime_status(unique_id, "running", "渲染最终提示词", time.time() - start_ts, 2, 2, timeout_seconds)
             print(f"[Luck GPT-Image-2 Prompt Optimizer] {model} 渲染阶段生成中")
-            optimized, _ = _call_apiyi_chat(api_base, api_key, model, renderer_messages, timeout_seconds)
+            optimized, _ = _call_chat_completion(api_base, api_key, model, renderer_messages, timeout_seconds)
 
             if optimize_strength == "增强" and text_policy == "generate":
                 optimized = optimized.replace("【限制条件】", "【创作自由】")
